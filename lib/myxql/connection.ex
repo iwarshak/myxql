@@ -93,18 +93,7 @@ defmodule MyXQL.Connection do
 
   @impl true
   def handle_execute(%Query{} = query, params, _opts, state) do
-    with {:ok, query, state} <- maybe_reprepare(query, state) do
-      result =
-        Client.com_stmt_execute(
-          state.client,
-          query.statement_id,
-          params,
-          :cursor_type_no_cursor
-        )
-
-      state = maybe_close(query, state)
-      result(result, query, state)
-    end
+    cached_execute(query, params, state)
   end
 
   def handle_execute(%TextQuery{statement: statement} = query, [], _opts, state) do
@@ -520,6 +509,12 @@ defmodule MyXQL.Connection do
     end
   end
 
+  defp cached_execute(query, params, state) do
+    with {:ok, query, state} <- maybe_reprepare(query, state) do
+      execute(query, params, state)
+    end
+  end
+
   ## Internals
 
   defp prepare(%Query{statement: statement} = query, state) do
@@ -532,5 +527,18 @@ defmodule MyXQL.Connection do
       result ->
         result(result, query, state)
     end
+  end
+
+  defp execute(query, params, state) do
+    result =
+      Client.com_stmt_execute(
+        state.client,
+        query.statement_id,
+        params,
+        :cursor_type_no_cursor
+      )
+
+    state = maybe_close(query, state)
+    result(result, query, state)
   end
 end
