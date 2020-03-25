@@ -74,24 +74,20 @@ defmodule MyXQL.Connection do
   def handle_prepare(query, opts, state) do
     query = rename_query(state, query)
 
-    if cached_query = queries_get(state, query) do
-      {:ok, cached_query, %{state | last_ref: cached_query.ref}}
-    else
-      case prepare(query, state) do
-        {:ok, _, _} = ok ->
-          ok
+    case cached_prepare(query, state) do
+      {:ok, _, _} = ok ->
+        ok
 
-        {:error, %MyXQL.Error{mysql: %{name: :ER_UNSUPPORTED_PS}}, state} = error ->
-          if Keyword.get(opts, :query_type) == :binary_then_text do
-            query = %MyXQL.TextQuery{statement: query.statement}
-            {:ok, query, state}
-          else
-            error
-          end
+      {:error, %MyXQL.Error{mysql: %{name: :ER_UNSUPPORTED_PS}}, state} = error ->
+        if Keyword.get(opts, :query_type) == :binary_then_text do
+          query = %MyXQL.TextQuery{statement: query.statement}
+          {:ok, query, state}
+        else
+          error
+        end
 
-        other ->
-          other
-      end
+      other ->
+        other
     end
   end
 
@@ -416,19 +412,6 @@ defmodule MyXQL.Connection do
   defp rename_query(%{prepare: :unnamed}, query),
     do: %{query | name: ""}
 
-  defp prepare(%Query{statement: statement} = query, state) do
-    case Client.com_stmt_prepare(state.client, statement) do
-      {:ok, com_stmt_prepare_ok(statement_id: statement_id, num_params: num_params)} ->
-        ref = make_ref()
-        query = %{query | num_params: num_params, statement_id: statement_id, ref: ref}
-        queries_put(state, query)
-        {:ok, query, %{state | last_ref: ref}}
-
-      result ->
-        result(result, query, state)
-    end
-  end
-
   defp maybe_reprepare(%{ref: ref} = query, %{last_ref: ref} = state), do: {:ok, query, state}
 
   defp maybe_reprepare(query, state) do
@@ -521,6 +504,33 @@ defmodule MyXQL.Connection do
       :ets.lookup_element(state.queries, cache_key(query), 2)
     rescue
       ArgumentError -> nil
+    end
+  end
+
+  ## Caching
+
+  defp cached_prepare(query, state) do
+    if cached_query = queries_get(state, query) do
+      {:ok, cached_query, %{state | last_ref: cached_query.ref}}
+    else
+      with {:ok, query, state} <- prepare(query, state) do
+        queries_put(state, query)
+        {:ok, query, %{state | last_ref: query.ref}}
+      end
+    end
+  end
+
+  ## Internals
+
+  defp prepare(%Query{statement: statement} = query, state) do
+    case Client.com_stmt_prepare(state.client, statement) do
+      {:ok, com_stmt_prepare_ok(statement_id: statement_id, num_params: num_params)} ->
+        ref = make_ref()
+        query = %{query | num_params: num_params, statement_id: statement_id, ref: ref}
+        {:ok, query, state}
+
+      result ->
+        result(result, query, state)
     end
   end
 end
