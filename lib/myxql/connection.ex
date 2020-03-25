@@ -195,155 +195,39 @@ defmodule MyXQL.Connection do
     end
   end
 
-  ## Internals
+  ## Caching
 
-  defp result(
-         {:ok,
-          ok_packet(
-            last_insert_id: last_insert_id,
-            affected_rows: affected_rows,
-            status_flags: status_flags,
-            num_warnings: num_warnings
-          )},
-         query,
-         state
-       ) do
-    result = %Result{
-      connection_id: state.client.connection_id,
-      last_insert_id: last_insert_id,
-      num_rows: affected_rows,
-      num_warnings: num_warnings
-    }
-
-    {:ok, query, result, put_status(state, status_flags)}
-  end
-
-  defp result(
-         {:ok,
-          resultset(
-            column_defs: column_defs,
-            num_rows: num_rows,
-            rows: rows,
-            status_flags: status_flags,
-            num_warnings: num_warnings
-          )},
-         query,
-         state
-       ) do
-    columns = Enum.map(column_defs, &elem(&1, 1))
-
-    result = %Result{
-      connection_id: state.client.connection_id,
-      columns: columns,
-      num_rows: num_rows,
-      rows: rows,
-      num_warnings: num_warnings
-    }
-
-    {:ok, query, result, put_status(state, status_flags)}
-  end
-
-  defp result({:ok, err_packet() = err_packet}, query, state) do
-    exception = error(err_packet, query, state)
-    maybe_disconnect(exception, state)
-  end
-
-  defp result({:error, :multiple_results}, _query, _state) do
-    raise RuntimeError, "returning multiple results is not yet supported"
-  end
-
-  defp result({:error, reason}, _query, state) do
-    {:disconnect, error(reason), state}
-  end
-
-  defp error(reason, %{statement: statement}, state) do
-    error(reason, statement, state)
-  end
-
-  defp error(reason, statement, state) do
-    exception = error(reason)
-    %MyXQL.Error{exception | statement: statement, connection_id: state.client.connection_id}
-  end
-
-  defp error(err_packet(code: code, message: message)) do
-    name = Protocol.error_code_to_name(code)
-    %MyXQL.Error{message: "(#{code}) (#{name}) " <> message, mysql: %{code: code, name: name}}
-  end
-
-  defp error(reason) do
-    %DBConnection.ConnectionError{message: format_reason(reason)}
-  end
-
-  defp format_reason(:timeout), do: "timeout"
-  defp format_reason(:closed), do: "socket closed"
-
-  defp format_reason({:tls_alert, {:bad_record_mac, _}} = reason) do
-    versions = :ssl.versions()[:supported]
-
-    """
-    #{:ssl.format_error({:error, reason})}
-
-    You might be using TLS version not supported by the server.
-    Protocol versions reported by the :ssl application: #{inspect(versions)}.
-    Set `:ssl_opts` in `MyXQL.start_link/1` to force specific protocol versions.
-    """
-  end
-
-  defp format_reason(reason) when is_atom(reason) do
-    List.to_string(:inet.format_error(reason))
-  end
-
-  defp format_reason(reason) do
-    case :ssl.format_error(reason) do
-      'Unexpected error' ++ _ ->
-        inspect(reason)
-
-      message ->
-        List.to_string(message)
-    end
-  end
-
-  defp maybe_disconnect(exception, state) do
-    %MyXQL.Error{mysql: %{name: error_name}} = exception
-
-    if error_name in state.disconnect_on_error_codes do
-      {:disconnect, exception, state}
+  defp cached_prepare(query, state) do
+    if cached_query = queries_get(state, query) do
+      {:ok, cached_query, %{state | last_ref: cached_query.ref}}
     else
-      {:error, exception, state}
+      with {:ok, query, state} <- prepare(query, state) do
+        queries_put(state, query)
+        {:ok, query, %{state | last_ref: query.ref}}
+      end
     end
   end
 
-  defp handle_transaction(call, statement, state) do
-    case Client.com_query(state.client, statement) do
-      {:ok, ok_packet()} = ok ->
-        {:ok, _query, result, state} = result(ok, call, state)
-        {:ok, result, state}
-
-      other ->
-        result(other, statement, state)
+  defp cached_execute(query, params, state) do
+    with {:ok, query, state} <- maybe_reprepare(query, state) do
+      execute(query, params, state)
     end
   end
 
-  defp transaction_status(status_flags) do
-    if has_status_flag?(status_flags, :server_status_in_trans) do
-      :transaction
-    else
-      :idle
+  defp cached_close(%{ref: ref} = query, %{last_ref: ref} = state) do
+    cached_close(query, %{state | last_ref: nil})
+  end
+
+  defp cached_close(query, state) do
+    queries_delete(state, query)
+    close(query, state)
+  end
+
+  defp cached_declare(query, params, state) do
+    with {:ok, query, state} <- maybe_reprepare(query, state) do
+      declare(query, params, state)
     end
   end
-
-  defp put_status(state, status_flags) do
-    %{state | transaction_status: transaction_status(status_flags)}
-  end
-
-  defp rename_query(%{prepare: :force_named}, query),
-    do: %{query | name: "force_#{System.unique_integer([:positive])}"}
-
-  defp rename_query(%{prepare: :named}, query),
-    do: query
-
-  defp rename_query(%{prepare: :unnamed}, query),
-    do: %{query | name: ""}
 
   defp maybe_reprepare(%{ref: ref} = query, %{last_ref: ref} = state), do: {:ok, query, state}
 
@@ -355,11 +239,8 @@ defmodule MyXQL.Connection do
     end
   end
 
-  # Close unnamed queries after executing them
   defp maybe_close(%Query{name: ""} = query, state), do: cached_close(query, state)
   defp maybe_close(_query, state), do: state
-
-  ## Cache query handling
 
   defp cache_key(%MyXQL.Query{cache: :reference, name: name}), do: name
   defp cache_key(%MyXQL.Query{cache: :statement, statement: statement}), do: statement
@@ -430,41 +311,16 @@ defmodule MyXQL.Connection do
     end
   end
 
-  ## Caching
-
-  defp cached_prepare(query, state) do
-    if cached_query = queries_get(state, query) do
-      {:ok, cached_query, %{state | last_ref: cached_query.ref}}
-    else
-      with {:ok, query, state} <- prepare(query, state) do
-        queries_put(state, query)
-        {:ok, query, %{state | last_ref: query.ref}}
-      end
-    end
-  end
-
-  defp cached_execute(query, params, state) do
-    with {:ok, query, state} <- maybe_reprepare(query, state) do
-      execute(query, params, state)
-    end
-  end
-
-  defp cached_close(%{ref: ref} = query, %{last_ref: ref} = state) do
-    cached_close(query, %{state | last_ref: nil})
-  end
-
-  defp cached_close(query, state) do
-    queries_delete(state, query)
-    close(query, state)
-  end
-
-  defp cached_declare(query, params, state) do
-    with {:ok, query, state} <- maybe_reprepare(query, state) do
-      declare(query, params, state)
-    end
-  end
-
   ## Internals
+
+  defp rename_query(%{prepare: :force_named}, query),
+    do: %{query | name: "force_#{System.unique_integer([:positive])}"}
+
+  defp rename_query(%{prepare: :named}, query),
+    do: query
+
+  defp rename_query(%{prepare: :unnamed}, query),
+    do: %{query | name: ""}
 
   defp prepare(%Query{statement: statement} = query, state) do
     case Client.com_stmt_prepare(state.client, statement) do
@@ -495,6 +351,8 @@ defmodule MyXQL.Connection do
     :ok = Client.com_stmt_close(state.client, query.statement_id)
     state
   end
+
+  ## Cursors
 
   defp declare(query, params, state) do
     cursor = %Cursor{ref: make_ref()}
@@ -549,6 +407,149 @@ defmodule MyXQL.Connection do
 
       other ->
         result(other, query, state)
+    end
+  end
+
+  ## Transactions
+
+  defp handle_transaction(call, statement, state) do
+    case Client.com_query(state.client, statement) do
+      {:ok, ok_packet()} = ok ->
+        {:ok, _query, result, state} = result(ok, call, state)
+        {:ok, result, state}
+
+      other ->
+        result(other, statement, state)
+    end
+  end
+
+  defp transaction_status(status_flags) do
+    if has_status_flag?(status_flags, :server_status_in_trans) do
+      :transaction
+    else
+      :idle
+    end
+  end
+
+  defp put_status(state, status_flags) do
+    %{state | transaction_status: transaction_status(status_flags)}
+  end
+
+  ## Result/Error
+
+  defp result(
+         {:ok,
+          ok_packet(
+            last_insert_id: last_insert_id,
+            affected_rows: affected_rows,
+            status_flags: status_flags,
+            num_warnings: num_warnings
+          )},
+         query,
+         state
+       ) do
+    result = %Result{
+      connection_id: state.client.connection_id,
+      last_insert_id: last_insert_id,
+      num_rows: affected_rows,
+      num_warnings: num_warnings
+    }
+
+    {:ok, query, result, put_status(state, status_flags)}
+  end
+
+  defp result(
+         {:ok,
+          resultset(
+            column_defs: column_defs,
+            num_rows: num_rows,
+            rows: rows,
+            status_flags: status_flags,
+            num_warnings: num_warnings
+          )},
+         query,
+         state
+       ) do
+    columns = Enum.map(column_defs, &elem(&1, 1))
+
+    result = %Result{
+      connection_id: state.client.connection_id,
+      columns: columns,
+      num_rows: num_rows,
+      rows: rows,
+      num_warnings: num_warnings
+    }
+
+    {:ok, query, result, put_status(state, status_flags)}
+  end
+
+  defp result({:ok, err_packet() = err_packet}, query, state) do
+    exception = error(err_packet, query, state)
+    maybe_disconnect(exception, state)
+  end
+
+  defp result({:error, :multiple_results}, _query, _state) do
+    raise RuntimeError, "returning multiple results is not yet supported"
+  end
+
+  defp result({:error, reason}, _query, state) do
+    {:disconnect, error(reason), state}
+  end
+
+  defp maybe_disconnect(exception, state) do
+    %MyXQL.Error{mysql: %{name: error_name}} = exception
+
+    if error_name in state.disconnect_on_error_codes do
+      {:disconnect, exception, state}
+    else
+      {:error, exception, state}
+    end
+  end
+
+  defp error(reason, %{statement: statement}, state) do
+    error(reason, statement, state)
+  end
+
+  defp error(reason, statement, state) do
+    exception = error(reason)
+    %MyXQL.Error{exception | statement: statement, connection_id: state.client.connection_id}
+  end
+
+  defp error(err_packet(code: code, message: message)) do
+    name = Protocol.error_code_to_name(code)
+    %MyXQL.Error{message: "(#{code}) (#{name}) " <> message, mysql: %{code: code, name: name}}
+  end
+
+  defp error(reason) do
+    %DBConnection.ConnectionError{message: format_reason(reason)}
+  end
+
+  defp format_reason(:timeout), do: "timeout"
+  defp format_reason(:closed), do: "socket closed"
+
+  defp format_reason({:tls_alert, {:bad_record_mac, _}} = reason) do
+    versions = :ssl.versions()[:supported]
+
+    """
+    #{:ssl.format_error({:error, reason})}
+
+    You might be using TLS version not supported by the server.
+    Protocol versions reported by the :ssl application: #{inspect(versions)}.
+    Set `:ssl_opts` in `MyXQL.start_link/1` to force specific protocol versions.
+    """
+  end
+
+  defp format_reason(reason) when is_atom(reason) do
+    List.to_string(:inet.format_error(reason))
+  end
+
+  defp format_reason(reason) do
+    case :ssl.format_error(reason) do
+      'Unexpected error' ++ _ ->
+        inspect(reason)
+
+      message ->
+        List.to_string(message)
     end
   end
 end
