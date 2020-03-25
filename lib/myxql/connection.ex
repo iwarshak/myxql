@@ -176,55 +176,8 @@ defmodule MyXQL.Connection do
   end
 
   @impl true
-  def handle_fetch(query, %Cursor{ref: cursor_ref}, opts, state) do
-    case Map.fetch!(state.cursors, cursor_ref) do
-      {:params, params, statement_id} ->
-        fetch_first(%{query | statement_id: statement_id}, cursor_ref, params, opts, state)
-
-      {:column_defs, column_defs, statement_id} ->
-        fetch_next(%{query | statement_id: statement_id}, cursor_ref, column_defs, opts, state)
-    end
-  end
-
-  defp fetch_first(query, cursor_ref, params, _opts, state) do
-    case Client.com_stmt_execute(state.client, query.statement_id, params, :cursor_type_read_only) do
-      {:ok, resultset(column_defs: column_defs, status_flags: status_flags)} = result ->
-        {:ok, _query, result, state} = result(result, query, state)
-
-        cursors =
-          Map.put(state.cursors, cursor_ref, {:column_defs, column_defs, query.statement_id})
-
-        state = put_status(%{state | cursors: cursors}, status_flags)
-
-        if has_status_flag?(status_flags, :server_status_cursor_exists) do
-          {:cont, result, state}
-        else
-          {:halt, result, state}
-        end
-
-      other ->
-        result(other, query, state)
-    end
-  end
-
-  defp fetch_next(query, _cursor_ref, column_defs, opts, state) do
-    max_rows = Keyword.get(opts, :max_rows, 500)
-    result = Client.com_stmt_fetch(state.client, query.statement_id, column_defs, max_rows)
-
-    case result do
-      {:ok, resultset(status_flags: status_flags)} ->
-        with {:ok, _query, result, state} <- result(result, query, state) do
-          if has_status_flag?(status_flags, :server_status_cursor_exists) do
-            {:cont, result, state}
-          else
-            true = has_status_flag?(status_flags, :server_status_last_row_sent)
-            {:halt, result, state}
-          end
-        end
-
-      other ->
-        result(other, query, state)
-    end
+  def handle_fetch(query, cursor, opts, state) do
+    fetch(query, cursor, opts, state)
   end
 
   @impl true
@@ -544,5 +497,54 @@ defmodule MyXQL.Connection do
     value = {:params, params, query.statement_id}
     state = %{state | cursors: Map.put(state.cursors, cursor.ref, value)}
     {:ok, query, cursor, state}
+  end
+
+  defp fetch(query, cursor, opts, state) do
+    case Map.fetch!(state.cursors, cursor.ref) do
+      {:params, params, statement_id} ->
+        fetch_first(%{query | statement_id: statement_id}, cursor.ref, params, opts, state)
+
+      {:column_defs, column_defs, statement_id} ->
+        fetch_next(%{query | statement_id: statement_id}, cursor.ref, column_defs, opts, state)
+    end
+  end
+
+  defp fetch_first(query, cursor_ref, params, _opts, state) do
+    case Client.com_stmt_execute(state.client, query.statement_id, params, :cursor_type_read_only) do
+      {:ok, resultset(column_defs: column_defs, status_flags: status_flags)} = result ->
+        {:ok, _query, result, state} = result(result, query, state)
+        value = {:column_defs, column_defs, query.statement_id}
+        cursors = Map.put(state.cursors, cursor_ref, value)
+        state = put_status(%{state | cursors: cursors}, status_flags)
+
+        if has_status_flag?(status_flags, :server_status_cursor_exists) do
+          {:cont, result, state}
+        else
+          {:halt, result, state}
+        end
+
+      other ->
+        result(other, query, state)
+    end
+  end
+
+  defp fetch_next(query, _cursor_ref, column_defs, opts, state) do
+    max_rows = Keyword.get(opts, :max_rows, 500)
+    result = Client.com_stmt_fetch(state.client, query.statement_id, column_defs, max_rows)
+
+    case result do
+      {:ok, resultset(status_flags: status_flags)} ->
+        with {:ok, _query, result, state} <- result(result, query, state) do
+          if has_status_flag?(status_flags, :server_status_cursor_exists) do
+            {:cont, result, state}
+          else
+            true = has_status_flag?(status_flags, :server_status_last_row_sent)
+            {:halt, result, state}
+          end
+        end
+
+      other ->
+        result(other, query, state)
+    end
   end
 end
