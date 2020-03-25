@@ -92,6 +92,10 @@ defmodule MyXQL.Connection do
   end
 
   @impl true
+  def handle_execute(%Query{name: ""} = query, params, _opts, state) do
+    cached_execute_close(query, params, state)
+  end
+
   def handle_execute(%Query{} = query, params, _opts, state) do
     cached_execute(query, params, state)
   end
@@ -208,6 +212,18 @@ defmodule MyXQL.Connection do
     end
   end
 
+  defp cached_execute_close(query, params, state) do
+    case cached_execute(query, params, state) do
+      {:ok, query, result, state} ->
+        state = cached_close(query, state)
+        {:ok, query, result, state}
+
+      {error, exception, state} ->
+        state = cached_close(query, state)
+        {error, exception, state}
+    end
+  end
+
   defp cached_execute(query, params, state) do
     with {:ok, query, state} <- maybe_reprepare(query, state) do
       execute(query, params, state)
@@ -238,9 +254,6 @@ defmodule MyXQL.Connection do
       prepare(query, state)
     end
   end
-
-  defp maybe_close(%Query{name: ""} = query, state), do: cached_close(query, state)
-  defp maybe_close(_query, state), do: state
 
   defp cache_key(%MyXQL.Query{cache: :reference, name: name}), do: name
   defp cache_key(%MyXQL.Query{cache: :statement, statement: statement}), do: statement
@@ -343,7 +356,6 @@ defmodule MyXQL.Connection do
         :cursor_type_no_cursor
       )
 
-    state = maybe_close(query, state)
     result(result, query, state)
   end
 
