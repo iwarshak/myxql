@@ -103,7 +103,7 @@ defmodule MyXQL.Connection do
 
   @impl true
   def handle_close(%Query{} = query, _opts, state) do
-    {:ok, nil, close(query, state)}
+    {:ok, nil, cached_close(query, state)}
   end
 
   @impl true
@@ -182,7 +182,7 @@ defmodule MyXQL.Connection do
 
   @impl true
   def handle_deallocate(%{name: ""} = query, _cursor, _opts, state) do
-    {:ok, nil, close(query, state)}
+    {:ok, nil, cached_close(query, state)}
   end
 
   def handle_deallocate(query, _cursor, _opts, state) do
@@ -356,18 +356,8 @@ defmodule MyXQL.Connection do
   end
 
   # Close unnamed queries after executing them
-  defp maybe_close(%Query{name: ""} = query, state), do: close(query, state)
+  defp maybe_close(%Query{name: ""} = query, state), do: cached_close(query, state)
   defp maybe_close(_query, state), do: state
-
-  defp close(%{ref: ref} = query, %{last_ref: ref} = state) do
-    close(query, %{state | last_ref: nil})
-  end
-
-  defp close(query, state) do
-    :ok = Client.com_stmt_close(state.client, query.statement_id)
-    queries_delete(state, query)
-    state
-  end
 
   ## Cache query handling
 
@@ -459,6 +449,15 @@ defmodule MyXQL.Connection do
     end
   end
 
+  defp cached_close(%{ref: ref} = query, %{last_ref: ref} = state) do
+    cached_close(query, %{state | last_ref: nil})
+  end
+
+  defp cached_close(query, state) do
+    queries_delete(state, query)
+    close(query, state)
+  end
+
   defp cached_declare(query, params, state) do
     with {:ok, query, state} <- maybe_reprepare(query, state) do
       declare(query, params, state)
@@ -490,6 +489,11 @@ defmodule MyXQL.Connection do
 
     state = maybe_close(query, state)
     result(result, query, state)
+  end
+
+  defp close(query, state) do
+    :ok = Client.com_stmt_close(state.client, query.statement_id)
+    state
   end
 
   defp declare(query, params, state) do
