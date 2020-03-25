@@ -172,16 +172,7 @@ defmodule MyXQL.Connection do
 
   @impl true
   def handle_declare(query, params, _opts, state) do
-    with {:ok, query, state} <- maybe_reprepare(query, state) do
-      cursor = %Cursor{ref: make_ref()}
-
-      state = %{
-        state
-        | cursors: Map.put(state.cursors, cursor.ref, {:params, params, query.statement_id})
-      }
-
-      {:ok, query, cursor, state}
-    end
+    cached_declare(query, params, state)
   end
 
   @impl true
@@ -515,6 +506,12 @@ defmodule MyXQL.Connection do
     end
   end
 
+  defp cached_declare(query, params, state) do
+    with {:ok, query, state} <- maybe_reprepare(query, state) do
+      declare(query, params, state)
+    end
+  end
+
   ## Internals
 
   defp prepare(%Query{statement: statement} = query, state) do
@@ -540,5 +537,12 @@ defmodule MyXQL.Connection do
 
     state = maybe_close(query, state)
     result(result, query, state)
+  end
+
+  defp declare(query, params, state) do
+    cursor = %Cursor{ref: make_ref()}
+    value = {:params, params, query.statement_id}
+    state = %{state | cursors: Map.put(state.cursors, cursor.ref, value)}
+    {:ok, query, cursor, state}
   end
 end
